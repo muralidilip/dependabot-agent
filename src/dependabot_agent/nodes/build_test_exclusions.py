@@ -1,0 +1,42 @@
+"""Build test exclusions node."""
+
+from __future__ import annotations
+
+from langchain_core.messages import AIMessage
+
+from dependabot_agent.logging_utils import (
+    log_build_error_summary,
+    log_build_result,
+    log_node_error,
+    log_node_start,
+)
+from dependabot_agent.state import AgentState
+from dependabot_agent.tools.agent_tools import run_build_and_test
+
+
+def build_test_exclusions_node(state: AgentState) -> dict:
+    """Deterministic: Run build and tests after exclusions."""
+    log_node_start("build_test_exclusions", "Testing build after exclusions")
+
+    try:
+        result = run_build_and_test.invoke({"workspace": state["workspace"], "context": "build_test_exclusions"})
+        success = result.get("success", False)
+        output = result.get("stdout", "") + "\n" + result.get("stderr", "")
+
+        log_build_result(success, "Exclusions build")
+        if not success:
+            log_build_error_summary(output)
+
+        return {
+            "build_success": success,
+            "build_output": output[:4000],
+            "messages": [AIMessage(content=f"Exclusions build {'succeeded' if success else 'failed'}")],
+        }
+    except Exception as e:
+        log_node_error("Build error", e)
+        return {
+            "build_success": False,
+            "build_output": str(e),
+            "messages": [AIMessage(content=f"Build error: {e}")],
+        }
+

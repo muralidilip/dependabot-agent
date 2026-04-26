@@ -41,7 +41,7 @@ def check_binary_search_done(state: AgentState) -> Literal["done", "continue"]:
     return "continue"
 
 
-def check_build_result(state: AgentState) -> Literal["verify", "need_exclusions", "failed"]:
+def check_build_result(state: AgentState) -> Literal["verify", "failed"]:
     """Check build result and route to verification or exclusions."""
     if state.get("build_success"):
         # Build passed - now verify that vulnerabilities are actually fixed

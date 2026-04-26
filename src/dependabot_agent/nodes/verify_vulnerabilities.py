@@ -30,14 +30,18 @@ def verify_vulnerabilities_node(state: AgentState) -> dict:
     attempt = state.get("verification_attempt_count", 0) + 1
     log_node_info(f"Verification attempt {attempt}")
 
-    # Get fresh dependency tree
+    # Get fresh dependency tree with alerts to find remaining vulnerabilities
     log_node_progress("Fetching fresh dependency tree to verify fixes...")
+    alerts = state.get("alerts", [])
     try:
         tree_result = get_dependency_tree.invoke({
             "workspace": state["workspace"],
+            "build_system": state["build_system"],
+            "alerts": alerts,
             "context": "verify_vulnerabilities"
         })
-        dep_tree = tree_result.get("tree", "")
+        dep_tree = tree_result.get("raw_tree", "")
+        vuln_parents = tree_result.get("vulnerability_parents", {})
     except Exception as e:
         log_node_warning(f"Could not get dependency tree for verification: {e}")
         # If we can't get the tree, assume vulnerabilities are fixed
@@ -50,7 +54,7 @@ def verify_vulnerabilities_node(state: AgentState) -> dict:
 
     # Get vulnerable package names from alerts
     vulnerable_packages = set()
-    for alert in state.get("alerts", []):
+    for alert in alerts:
         pkg = alert.get("package", "")
         if pkg:
             vulnerable_packages.add(pkg)

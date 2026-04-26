@@ -19,7 +19,7 @@ def final_build_node(state: AgentState) -> dict:
     log_node_start("final_build", "Running final build verification")
 
     try:
-        result = run_build_and_test.invoke({"workspace": state["workspace"], "context": "final_build"})
+        result = run_build_and_test.invoke({"workspace": state["workspace"], "build_system": state["build_system"], "context": "final_build"})
         success = result.get("success", False)
         output = result.get("stdout", "") + "\n" + result.get("stderr", "")
 

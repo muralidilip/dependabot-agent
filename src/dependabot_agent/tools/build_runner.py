@@ -9,13 +9,11 @@ import sys
 
 
 def _run(
-    cmd: list[str], cwd: str, timeout: int = 600, verbose: bool = True, context: str = ""
+    cmd: list[str], cwd: str, timeout: int = 600, verbose: bool = True
 ) -> subprocess.CompletedProcess[str]:
     """Run a command and optionally stream output to console in real-time."""
     if verbose:
         print(f"\n{'─'*40}", file=sys.stderr)
-        if context:
-            print(f"📌 Node: {context}", file=sys.stderr)
         print(f"{'='*60}", file=sys.stderr)
         print(f"Running: {' '.join(cmd)}", file=sys.stderr)
         print(f"Working directory: {cwd}", file=sys.stderr)
@@ -87,27 +85,25 @@ def build_file_path(workspace: str) -> str:
     raise FileNotFoundError("No build file found in " + workspace)
 
 
-def build_and_test(workspace: str, verbose: bool = True, context: str = "") -> dict[str, object]:
+def build_and_test(workspace: str, build_system: str, verbose: bool = True) -> dict[str, object]:
     """Run a full build + tests and return success status and output.
     
     Args:
         workspace: Path to the project workspace.
+        build_system: The build system type ('gradle' or 'maven').
         verbose: If True, stream build output to stderr in real-time.
-        context: Optional context string (e.g., node name) to prefix output.
     """
-    system = detect_build_system(workspace)
-
-    if system == "gradle":
+    if build_system == "gradle":
         # Use the wrapper if available
         wrapper = os.path.join(workspace, "gradlew")
         _ensure_executable(wrapper)
         cmd_prefix = [wrapper] if os.path.isfile(wrapper) else ["gradle"]
-        result = _run(cmd_prefix + ["clean", "build", "--no-daemon", "--stacktrace"], cwd=workspace, verbose=verbose, context=context)
+        result = _run(cmd_prefix + ["clean", "build", "--no-daemon", "--stacktrace"], cwd=workspace, verbose=verbose)
     else:
         wrapper = os.path.join(workspace, "mvnw")
         _ensure_executable(wrapper)
         cmd_prefix = [wrapper] if os.path.isfile(wrapper) else ["mvn"]
-        result = _run(cmd_prefix + ["clean", "verify", "-B", "-e"], cwd=workspace, verbose=verbose, context=context)
+        result = _run(cmd_prefix + ["clean", "verify", "-B", "-e"], cwd=workspace, verbose=verbose)
 
     return {
         "success": result.returncode == 0,
@@ -123,54 +119,292 @@ def _truncate(text: str, max_len: int) -> str:
     return text[:max_len] + "\n... (truncated)"
 
 
-def get_dependency_tree(workspace: str, verbose: bool = True, context: str = "") -> dict[str, object]:
-    """Get the dependency tree for the project.
+def get_dependency_tree(
+    workspace: str,
+    build_system: str,
+    alerts: list[dict] | None = None,
+    verbose: bool = True
+) -> dict[str, object]:
+    """Get the dependency tree for the project, filtered to show only vulnerable dependencies.
 
     Args:
         workspace: Path to the project workspace.
+        build_system: The build system type ('gradle' or 'maven').
+        alerts: List of Dependabot alerts. If provided, returns only vulnerable deps with their parents.
         verbose: If True, stream output to stderr in real-time.
-        context: Optional context string (e.g., node name) to prefix output.
 
     Returns:
-        Dict with success status and dependency tree output.
+        Dict with:
+        - success: bool
+        - vulnerability_parents: Dict mapping "group:artifact:version" -> [list of root parent coords]
+        - raw_tree: The raw dependency tree output (truncated)
     """
-    system = detect_build_system(workspace)
+    import re
 
-    if system == "gradle":
+    vulnerability_parents: dict[str, list[str]] = {}
+    combined_tree = ""
+    success = False
+    return_code = 1
+    stderr = ""
+
+    if build_system == "gradle":
         wrapper = os.path.join(workspace, "gradlew")
         _ensure_executable(wrapper)
         cmd_prefix = [wrapper] if os.path.isfile(wrapper) else ["gradle"]
+
+        # Get all configurations dependency tree
         result = _run(
-            cmd_prefix + ["dependencies", "--configuration", "compileClasspath", "--no-daemon"],
+            cmd_prefix + ["dependencies", "--no-daemon"],
             cwd=workspace,
-            verbose=verbose,
-            context=context
+            verbose=verbose
         )
-    else:
+
+        all_tree = result.stdout or ""
+        success = result.returncode == 0
+        return_code = result.returncode
+        stderr = result.stderr or ""
+
+        # Also get buildEnvironment (build script/plugin dependencies)
+        result_build_env = _run(
+            cmd_prefix + ["buildEnvironment", "--no-daemon"],
+            cwd=workspace,
+            verbose=verbose
+        )
+
+        build_env_tree = result_build_env.stdout or ""
+
+        # Combine both trees for parsing
+        combined_tree = all_tree
+        if build_env_tree:
+            combined_tree += "\n\n" + "=" * 60 + "\n"
+            combined_tree += "BUILD ENVIRONMENT (Plugin Dependencies)\n"
+            combined_tree += "=" * 60 + "\n\n"
+            combined_tree += build_env_tree
+
+        # If alerts provided, extract only vulnerability info
+        if alerts:
+            vulnerability_parents = _extract_vulnerability_parents(
+                combined_tree, alerts, build_system
+            )
+
+    else:  # Maven
         wrapper = os.path.join(workspace, "mvnw")
         _ensure_executable(wrapper)
         cmd_prefix = [wrapper] if os.path.isfile(wrapper) else ["mvn"]
+
+        # Get full dependency tree
         result = _run(
             cmd_prefix + ["dependency:tree", "-B"],
             cwd=workspace,
-            verbose=verbose,
-            context=context
+            verbose=verbose
         )
 
+        combined_tree = result.stdout or ""
+        success = result.returncode == 0
+        return_code = result.returncode
+        stderr = result.stderr or ""
+
+        # If alerts provided, extract only vulnerability info
+        if alerts:
+            vulnerability_parents = _extract_vulnerability_parents(
+                combined_tree, alerts, build_system
+            )
+
     return {
-        "success": result.returncode == 0,
-        "return_code": result.returncode,
-        "tree": _truncate(result.stdout, 15000),
-        "stderr": _truncate(result.stderr, 3000),
+        "success": success,
+        "return_code": return_code,
+        "vulnerability_parents": vulnerability_parents,
+        "raw_tree": _truncate(combined_tree, 30000),
+        "stderr": _truncate(stderr, 3000),
     }
+
+
+def _extract_vulnerability_parents(
+    dep_tree: str,
+    alerts: list[dict],
+    build_system: str
+) -> dict[str, list[str]]:
+    """Extract vulnerable dependencies and their root parents from dependency tree.
+
+    Args:
+        dep_tree: The raw dependency tree output
+        alerts: List of Dependabot alerts with 'package' and optionally 'first_patched_version'
+        build_system: 'gradle' or 'maven'
+
+    Returns:
+        Dict mapping "group:artifact:version" -> [list of root parent coordinates]
+        e.g., {"tools.jackson.core:jackson-core:3.1.0": ["org.springframework.boot:spring-boot-starter-webflux:4.0.5"]}
+    """
+    import re
+
+    vulnerability_parents: dict[str, list[str]] = {}
+
+    # Extract vulnerable package names from alerts
+    vulnerable_packages: set[str] = set()
+    for alert in alerts:
+        pkg = alert.get("package", "")
+        if pkg and ":" in pkg:
+            vulnerable_packages.add(pkg)
+
+    if not vulnerable_packages:
+        return vulnerability_parents
+
+    lines = dep_tree.split("\n")
+
+    if build_system == "gradle":
+        # Parse Gradle dependency tree format
+        # Track the hierarchy using indentation
+        # +--- org.springframework.boot:spring-boot-starter-mongodb -> 4.0.0  (BOM-managed, no declared version)
+        # |    +--- org.springframework.boot:spring-boot-starter:4.0.0
+        # |    |    +--- org.springframework.boot:spring-boot-starter-logging:4.0.0
+        # |    |    |    +--- ch.qos.logback:logback-classic:1.5.21
+        # |    |    |    |    +--- ch.qos.logback:logback-core:1.5.21
+        #
+        # Skip special Gradle markers:
+        # - (c) = constraint (from BOM, not a real dependency)
+        # - (*) = duplicate (already shown elsewhere)
+        # - (n) = not resolved
+
+        # Stack to track parent hierarchy: [(depth, coordinate)]
+        parent_stack: list[tuple[int, str]] = []
+
+        for line in lines:
+            # Skip non-dependency lines
+            if "+---" not in line and "\\---" not in line:
+                continue
+
+            # Skip constraint entries (c), duplicates (*), and not-resolved (n)
+            # These are not real dependencies that bring in transitives
+            if "(c)" in line or "(*)" in line or "(n)" in line:
+                continue
+
+            # Calculate depth based on position of the marker
+            marker_pos = line.find("+---")
+            if marker_pos == -1:
+                marker_pos = line.find("\\---")
+            if marker_pos == -1:
+                continue
+
+            depth = marker_pos
+
+            # Extract the dependency coordinate
+            # Handle multiple formats:
+            # 1. group:artifact:version
+            # 2. group:artifact:version -> resolved_version
+            # 3. group:artifact -> resolved_version (BOM-managed, no declared version)
+            
+            # First try: group:artifact:declared_version -> resolved_version
+            match = re.search(r'([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)\s*->\s*([a-zA-Z0-9._-]+)', line)
+            if match:
+                group_id = match.group(1)
+                artifact_id = match.group(2)
+                resolved_version = match.group(4)  # Use resolved version
+            else:
+                # Second try: group:artifact -> resolved_version (BOM-managed)
+                match = re.search(r'([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)\s*->\s*([a-zA-Z0-9._-]+)', line)
+                if match:
+                    group_id = match.group(1)
+                    artifact_id = match.group(2)
+                    resolved_version = match.group(3)
+                else:
+                    # Third try: group:artifact:version (no override)
+                    match = re.search(r'([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)', line)
+                    if match:
+                        group_id = match.group(1)
+                        artifact_id = match.group(2)
+                        resolved_version = match.group(3)
+                    else:
+                        continue
+
+            coord = f"{group_id}:{artifact_id}"
+            full_coord = f"{group_id}:{artifact_id}:{resolved_version}"
+
+            # Pop parents that are at same or greater depth (siblings or uncles)
+            while parent_stack and parent_stack[-1][0] >= depth:
+                parent_stack.pop()
+
+            # Check if this is a vulnerable package
+            if coord in vulnerable_packages:
+                # Find root parent (first item in stack, or self if top-level)
+                if parent_stack:
+                    root_parent = parent_stack[0][1]
+                    if full_coord not in vulnerability_parents:
+                        vulnerability_parents[full_coord] = []
+                    if root_parent not in vulnerability_parents[full_coord]:
+                        vulnerability_parents[full_coord].append(root_parent)
+                else:
+                    # This is a top-level (direct) dependency
+                    if full_coord not in vulnerability_parents:
+                        vulnerability_parents[full_coord] = []
+                    if "DIRECT" not in vulnerability_parents[full_coord]:
+                        vulnerability_parents[full_coord].append("DIRECT")
+
+            # Push this dependency onto the stack
+            parent_stack.append((depth, full_coord))
+
+    else:
+        # Maven dependency tree format
+        # [INFO] +- org.springframework.boot:spring-boot-starter-webflux:jar:4.0.5:compile
+        # [INFO] |  +- org.springframework.boot:spring-boot-starter-json:jar:4.0.5:compile
+        # [INFO] |  |  +- tools.jackson.core:jackson-databind:jar:3.1.0:compile
+
+        parent_stack: list[tuple[int, str]] = []
+
+        for line in lines:
+            # Skip non-dependency lines
+            if ("+-" not in line and "\\-" not in line) or ":" not in line:
+                continue
+
+            # Find the marker position
+            marker_pos = line.find("+-")
+            if marker_pos == -1:
+                marker_pos = line.find("\\-")
+            if marker_pos == -1:
+                continue
+
+            depth = marker_pos
+
+            # Extract Maven coordinate: group:artifact:packaging:version:scope
+            match = re.search(r'([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):(?:jar|war|pom):([a-zA-Z0-9._-]+)', line)
+            if not match:
+                continue
+
+            group_id = match.group(1)
+            artifact_id = match.group(2)
+            version = match.group(3)
+
+            coord = f"{group_id}:{artifact_id}"
+            full_coord = f"{group_id}:{artifact_id}:{version}"
+
+            # Pop parents at same or greater depth
+            while parent_stack and parent_stack[-1][0] >= depth:
+                parent_stack.pop()
+
+            # Check if vulnerable
+            if coord in vulnerable_packages:
+                if parent_stack:
+                    root_parent = parent_stack[0][1]
+                    if full_coord not in vulnerability_parents:
+                        vulnerability_parents[full_coord] = []
+                    if root_parent not in vulnerability_parents[full_coord]:
+                        vulnerability_parents[full_coord].append(root_parent)
+                else:
+                    if full_coord not in vulnerability_parents:
+                        vulnerability_parents[full_coord] = []
+                    if "DIRECT" not in vulnerability_parents[full_coord]:
+                        vulnerability_parents[full_coord].append("DIRECT")
+
+            parent_stack.append((depth, full_coord))
+
+    return vulnerability_parents
 
 
 def build_vulnerability_map(
     workspace: str,
     vulnerable_packages: list[str],
     build_content: str,
-    verbose: bool = False,
-    context: str = ""
+    build_system: str,
+    verbose: bool = False
 ) -> dict[str, object]:
     """Build a map of parent dependencies to their vulnerable transitive dependencies.
 
@@ -192,8 +426,8 @@ def build_vulnerability_map(
         workspace: Path to the project workspace.
         vulnerable_packages: List of vulnerable packages (e.g., ["org.thymeleaf:thymeleaf"])
         build_content: Current build file content (to identify direct deps)
+        build_system: The build system type ('gradle' or 'maven')
         verbose: If True, stream output to stderr.
-        context: Optional context string for logging.
 
     Returns:
         {
@@ -210,10 +444,8 @@ def build_vulnerability_map(
     """
     import re
 
-    system = detect_build_system(workspace)
-
     # Extract direct dependencies from build file (for finding root parent in chain)
-    direct_deps = _extract_direct_deps(build_content, system)
+    direct_deps = _extract_direct_deps(build_content, build_system)
 
     parent_to_vulns: dict[str, list[dict]] = {}
     buildscript_vulns: list[str] = []  # Vulnerabilities from buildEnvironment (plugins)
@@ -226,7 +458,7 @@ def build_vulnerability_map(
 
         # ALWAYS run dependency insight to find if it's a transitive dependency
         # Don't skip based on whether it's in the build file - it might be a previous pin
-        insight = _get_dependency_insight(workspace, pkg, system, verbose, context)
+        insight = _get_dependency_insight(workspace, pkg, build_system, verbose)
 
         if not insight["success"] or not insight["parent_chain"]:
             # Dependency not found in tree - could be:
@@ -322,8 +554,7 @@ def _get_dependency_insight(
     workspace: str,
     dependency: str,
     build_system: str,
-    verbose: bool = False,
-    context: str = ""
+    verbose: bool = False
 ) -> dict[str, object]:
     """Get dependency insight for a specific dependency.
 
@@ -362,7 +593,6 @@ def _get_dependency_insight(
             ],
             cwd=workspace,
             verbose=verbose,
-            context=context,
             timeout=120
         )
 
@@ -379,7 +609,6 @@ def _get_dependency_insight(
                 ],
                 cwd=workspace,
                 verbose=verbose,
-                context=context,
                 timeout=120
             )
 
@@ -401,7 +630,6 @@ def _get_dependency_insight(
                 ],
                 cwd=workspace,
                 verbose=verbose,
-                context=context,
                 timeout=120
             )
 
@@ -429,7 +657,6 @@ def _get_dependency_insight(
             ],
             cwd=workspace,
             verbose=verbose,
-            context=context,
             timeout=120
         )
 
@@ -637,28 +864,25 @@ def _find_parent_heuristic(vuln_dep: str, direct_deps: set[str]) -> str | None:
     return None
 
 
-def compile_only(workspace: str, verbose: bool = True, context: str = "") -> dict[str, object]:
+def compile_only(workspace: str, build_system: str, verbose: bool = True) -> dict[str, object]:
     """Run only compilation (no tests) to quickly validate changes.
 
     Args:
         workspace: Path to the project workspace.
+        build_system: The build system type ('gradle' or 'maven').
         verbose: If True, stream output to stderr in real-time.
-        context: Optional context string (e.g., node name) to prefix output.
 
     Returns:
         Dict with success status and output.
     """
-    system = detect_build_system(workspace)
-
-    if system == "gradle":
+    if build_system == "gradle":
         wrapper = os.path.join(workspace, "gradlew")
         _ensure_executable(wrapper)
         cmd_prefix = [wrapper] if os.path.isfile(wrapper) else ["gradle"]
         result = _run(
             cmd_prefix + ["compileJava", "--no-daemon", "--stacktrace"],
             cwd=workspace,
-            verbose=verbose,
-            context=context
+            verbose=verbose
         )
     else:
         wrapper = os.path.join(workspace, "mvnw")
@@ -667,8 +891,7 @@ def compile_only(workspace: str, verbose: bool = True, context: str = "") -> dic
         result = _run(
             cmd_prefix + ["compile", "-B", "-e"],
             cwd=workspace,
-            verbose=verbose,
-            context=context
+            verbose=verbose
         )
 
     return {

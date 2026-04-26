@@ -79,20 +79,20 @@ def write_build_file(workspace: str, content: str) -> dict[str, str]:
 
 
 @tool
-def run_build_and_test(workspace: str, context: str = "") -> dict[str, object]:
+def run_build_and_test(workspace: str, build_system: str) -> dict[str, object]:
     """Run a full clean build + test in the workspace.
 
     Args:
         workspace: the local clone directory.
-        context: Optional context string (e.g., node name) for logging.
+        build_system: The build system type ('gradle' or 'maven').
 
     Returns success flag, return code, and truncated stdout/stderr.
     """
-    return _build_and_test(workspace, context=context)
+    return _build_and_test(workspace, build_system)
 
 
 @tool
-def run_compile_only(workspace: str, context: str = "") -> dict[str, object]:
+def run_compile_only(workspace: str, build_system: str) -> dict[str, object]:
     """Run only compilation (no tests) to quickly validate dependency changes.
 
     This is faster than a full build and useful for testing if dependency
@@ -100,30 +100,38 @@ def run_compile_only(workspace: str, context: str = "") -> dict[str, object]:
 
     Args:
         workspace: the local clone directory.
-        context: Optional context string (e.g., node name) for logging.
+        build_system: The build system type ('gradle' or 'maven').
 
     Returns success flag, return code, and truncated stdout/stderr.
     """
-    return _compile_only(workspace, context=context)
+    return _compile_only(workspace, build_system)
 
 
 @tool
-def get_dependency_tree(workspace: str, context: str = "") -> dict[str, object]:
-    """Get the dependency tree for the project.
+def get_dependency_tree(
+    workspace: str,
+    build_system: str,
+    alerts: list[dict] | None = None
+) -> dict[str, object]:
+    """Get the dependency tree for the project, filtered to show vulnerable dependencies.
 
-    For Gradle: runs 'gradle dependencies --configuration compileClasspath'
+    For Gradle: runs 'gradle dependencies' and 'gradle buildEnvironment'
     For Maven: runs 'mvn dependency:tree'
 
-    Use this to understand which dependencies are parents of vulnerable
-    transitive dependencies, and to verify that upgrades resolved issues.
+    When alerts are provided, returns a focused view showing only vulnerable
+    dependencies and their root parent dependencies.
 
     Args:
         workspace: the local clone directory.
-        context: Optional context string (e.g., node name) for logging.
+        build_system: The build system type ('gradle' or 'maven').
+        alerts: Optional list of Dependabot alerts to filter results.
 
-    Returns success flag and the dependency tree output.
+    Returns:
+        - success: bool
+        - vulnerability_parents: Dict mapping "group:artifact:version" -> [root parents]
+        - raw_tree: The raw dependency tree output (truncated)
     """
-    return _get_dependency_tree(workspace, context=context)
+    return _get_dependency_tree(workspace, build_system, alerts=alerts)
 
 
 @tool
@@ -131,7 +139,7 @@ def build_vulnerability_map(
     workspace: str,
     vulnerable_packages: list[str],
     build_content: str,
-    context: str = ""
+    build_system: str
 ) -> dict[str, object]:
     """Build a map of parent dependencies to their vulnerable transitive dependencies.
 
@@ -144,7 +152,7 @@ def build_vulnerability_map(
         vulnerable_packages: List of vulnerable packages from Dependabot alerts
                             (e.g., ["org.thymeleaf:thymeleaf", "jackson-databind"])
         build_content: Current build file content (to identify direct deps).
-        context: Optional context string for logging.
+        build_system: The build system type ('gradle' or 'maven').
 
     Returns:
         {
@@ -160,8 +168,8 @@ def build_vulnerability_map(
         workspace,
         vulnerable_packages,
         build_content,
-        verbose=False,
-        context=context
+        build_system,
+        verbose=False
     )
 
 

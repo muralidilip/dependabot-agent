@@ -4,6 +4,9 @@ from dependabot_agent.helpers.build_file import (
     apply_upgrades_to_content,
     extract_dependencies_from_gradle,
     extract_dependencies_from_maven,
+    find_redundant_pins,
+    remove_duplicate_exclusions,
+    remove_redundant_pins,
     validate_no_dependencies_removed,
     version_already_applied,
 )
@@ -23,6 +26,9 @@ __all__ = [
     "apply_upgrades_to_content",
     "extract_dependencies_from_gradle",
     "extract_dependencies_from_maven",
+    "find_redundant_pins",
+    "remove_duplicate_exclusions",
+    "remove_redundant_pins",
     "validate_no_dependencies_removed",
     "version_already_applied",
     # Dependency tree helpers

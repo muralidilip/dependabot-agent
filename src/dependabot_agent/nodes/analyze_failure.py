@@ -36,8 +36,8 @@ def analyze_failure_and_retry_node(state: AgentState) -> dict:
     # Get fresh dependency tree
     log_node_progress("Fetching fresh dependency tree...")
     try:
-        tree_result = get_dependency_tree.invoke({"workspace": state["workspace"], "context": "analyze_failure_and_retry"})
-        dep_tree = tree_result.get("tree", "")[:5000]
+        tree_result = get_dependency_tree.invoke({"workspace": state["workspace"], "build_system": state["build_system"], "context": "analyze_failure_and_retry"})
+        dep_tree = tree_result.get("raw_tree", "")[:5000]
     except:
         log_node_warning("Could not fetch dependency tree")
         dep_tree = ""

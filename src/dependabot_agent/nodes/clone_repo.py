@@ -16,10 +16,10 @@ from dependabot_agent.tools.agent_tools import clone_repository
 
 def clone_repo_node(state: AgentState) -> dict:
     """Deterministic: Clone repo and read build file."""
-    log_node_start("clone_repo", f"Cloning {state['repo']} (develop branch)")
+    log_node_start("clone_repo", f"Cloning {state.get('repo')} (develop branch)")
 
     try:
-        result = clone_repository.invoke({"repo": state["repo"], "branch": "develop"})
+        result = clone_repository.invoke({"repo": state.get('repo'), "branch": "develop"})
 
         log_workspace_info(
             result["workspace"],

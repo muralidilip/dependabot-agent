@@ -139,7 +139,6 @@ def build_graph():
         check_build_result,
         {
             "verify": "verify_vulnerabilities",  # Build passed, verify vulns are fixed
-            "need_exclusions": "try_exclusions",  # Shouldn't happen after good build
             "failed": "try_exclusions",
         }
     )

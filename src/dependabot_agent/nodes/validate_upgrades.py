@@ -19,7 +19,7 @@ def validate_upgrades_node(state: AgentState) -> dict:
     log_node_start("validate_upgrades", "Compiling to validate upgrades")
 
     try:
-        result = run_compile_only.invoke({"workspace": state["workspace"], "context": "validate_upgrades"})
+        result = run_compile_only.invoke({"workspace": state["workspace"], "build_system": state["build_system"], "context": "validate_upgrades"})
         success = result.get("success", False)
         output = result.get("stdout", "") + "\n" + result.get("stderr", "")
 

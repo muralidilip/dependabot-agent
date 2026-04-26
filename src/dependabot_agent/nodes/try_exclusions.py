@@ -56,6 +56,7 @@ def try_exclusions_node(state: AgentState) -> dict:
             "workspace": state["workspace"],
             "vulnerable_packages": vulnerable_packages,
             "build_content": state["current_build_content"],
+            "build_system": state["build_system"],
             "context": "try_exclusions"
         })
     except Exception as e:

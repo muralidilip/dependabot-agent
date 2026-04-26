@@ -19,7 +19,7 @@ def build_test_exclusions_node(state: AgentState) -> dict:
     log_node_start("build_test_exclusions", "Testing build after exclusions")
 
     try:
-        result = run_build_and_test.invoke({"workspace": state["workspace"], "context": "build_test_exclusions"})
+        result = run_build_and_test.invoke({"workspace": state["workspace"], "build_system": state["build_system"], "context": "build_test_exclusions"})
         success = result.get("success", False)
         output = result.get("stdout", "") + "\n" + result.get("stderr", "")
 

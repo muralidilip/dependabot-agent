@@ -101,7 +101,7 @@ def binary_search_upgrades_node(state: AgentState) -> dict:
         })
 
         # Test first half
-        result = run_compile_only.invoke({"workspace": state["workspace"], "context": "binary_search_upgrades"})
+        result = run_compile_only.invoke({"workspace": state["workspace"], "build_system": state["build_system"], "context": "binary_search_upgrades"})
 
         if result.get("success"):
             # First half is good, problem is in second half

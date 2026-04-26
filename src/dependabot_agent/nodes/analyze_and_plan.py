@@ -33,7 +33,10 @@ def analyze_and_plan_node(state: AgentState) -> dict:
     ))
     alerts_summary = json.dumps(sorted_alerts, indent=2, sort_keys=True)
     build_content = state["current_build_content"]
-    dep_tree = state.get("dependency_tree", "")[:5000]  # Truncate if too long
+
+    # Generate LLM-friendly vulnerability summary from vulnerability_parents
+    vuln_parents = state.get("vulnerability_parents", {})
+    vuln_summary = _format_vulnerability_summary(vuln_parents, state.get("alerts", []))
 
     log_node_progress("Invoking LLM for analysis...")
 
@@ -47,10 +50,8 @@ def analyze_and_plan_node(state: AgentState) -> dict:
 {build_content}
 ```
 
-## Dependency Tree (truncated):
-```
-{dep_tree}
-```
+## Vulnerability Analysis:
+{vuln_summary if vuln_summary else "No vulnerability analysis available - dependency tree not parsed."}
 
 Analyze and provide your upgrade plan as JSON.
 """
@@ -161,4 +162,123 @@ Analyze and provide your upgrade plan as JSON.
             AIMessage(content=f"Planned {len(needed_upgrades)} upgrades"),
         ],
     }
+
+
+def _format_vulnerability_summary(
+    vuln_parents: dict[str, list[str]],
+    alerts: list[dict]
+) -> str:
+    """Format vulnerability_parents into an LLM-friendly summary.
+
+    Returns a structured text showing:
+    - Each vulnerable dependency
+    - What root dependency brings it in (or if it's direct)
+    - The patched version to upgrade to
+    - Recommended action (exclusion + pin, or direct upgrade)
+    """
+    if not vuln_parents:
+        return "No vulnerability parent information available."
+
+    # Build alert lookup for patched versions and severity
+    alert_info = {}
+    for alert in alerts:
+        pkg = alert.get("package", "")
+        if pkg:
+            alert_info[pkg] = {
+                "severity": alert.get("severity", "unknown"),
+                "patched_version": alert.get("first_patched_version", ""),
+                "summary": alert.get("summary", ""),
+            }
+
+    lines = []
+    lines.append("## Vulnerability Analysis")
+    lines.append("")
+    lines.append("Found the following vulnerable dependencies in the dependency tree:")
+    lines.append("")
+
+    # Group by action type
+    direct_deps = []
+    transitive_deps = []
+
+    for vuln_coord, parents in vuln_parents.items():
+        # Parse the vulnerable dependency coordinate
+        parts = vuln_coord.split(":")
+        if len(parts) >= 2:
+            pkg = f"{parts[0]}:{parts[1]}"
+            version = parts[2] if len(parts) > 2 else "unknown"
+        else:
+            pkg = vuln_coord
+            version = "unknown"
+
+        info = alert_info.get(pkg, {})
+        severity = info.get("severity", "unknown")
+        patched = info.get("patched_version", "latest")
+        summary = info.get("summary", "")
+
+        if "DIRECT" in parents:
+            direct_deps.append({
+                "coord": vuln_coord,
+                "pkg": pkg,
+                "version": version,
+                "severity": severity,
+                "patched": patched,
+                "summary": summary,
+            })
+        else:
+            transitive_deps.append({
+                "coord": vuln_coord,
+                "pkg": pkg,
+                "version": version,
+                "severity": severity,
+                "patched": patched,
+                "summary": summary,
+                "parents": parents,
+            })
+
+    # Direct dependencies - just need version upgrade
+    if direct_deps:
+        lines.append("### Direct Dependencies (upgrade version in build file)")
+        lines.append("")
+        for dep in direct_deps:
+            lines.append(f"- **{dep['coord']}** [{dep['severity'].upper()}]")
+            if dep['summary']:
+                lines.append(f"  - Issue: {dep['summary']}")
+            lines.append(f"  - Action: Upgrade to version {dep['patched'] or 'latest'}")
+            lines.append("")
+
+    # Transitive dependencies - need exclusion from parent + pin safe version
+    if transitive_deps:
+        lines.append("### Transitive Dependencies (try upgrading parent first)")
+        lines.append("")
+
+        # Group by parent for clearer presentation
+        parent_to_vulns: dict[str, list[dict]] = {}
+        for dep in transitive_deps:
+            for parent in dep['parents']:
+                if parent not in parent_to_vulns:
+                    parent_to_vulns[parent] = []
+                parent_to_vulns[parent].append(dep)
+
+        # Show parent-centric view
+        for parent, deps in parent_to_vulns.items():
+            parent_parts = parent.split(":")
+            parent_name = f"{parent_parts[0]}:{parent_parts[1]}" if len(parent_parts) >= 2 else parent
+
+            lines.append(f"**Parent: {parent}**")
+            lines.append(f"- Action: Upgrade {parent_name} to latest version - this may fix all vulnerabilities below")
+            lines.append("")
+            lines.append("  Vulnerable transitive dependencies:")
+            for dep in deps:
+                lines.append(f"  - {dep['coord']} [{dep['severity'].upper()}] → needs {dep['patched'] or 'latest'}")
+                if dep['summary']:
+                    lines.append(f"    Issue: {dep['summary']}")
+            lines.append("")
+
+    # Summary counts
+    lines.append("### Summary")
+    lines.append(f"- Direct vulnerabilities to upgrade: {len(direct_deps)}")
+    lines.append(f"- Transitive vulnerabilities needing exclusions: {len(transitive_deps)}")
+
+    return "\n".join(lines)
+
 

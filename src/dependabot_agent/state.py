@@ -20,6 +20,7 @@ class AgentState(TypedDict):
     current_build_content: str
     alerts: list[dict[str, Any]]
     dependency_tree: str
+    vulnerability_parents: dict[str, list[str]]  # Vulnerable dep -> [root parents]
     planned_upgrades: list[dict[str, Any]]  # [{group_id, artifact_id, current, target}]
     good_upgrades: list[dict[str, Any]]  # Upgrades that passed validation
     bad_upgrades: list[dict[str, Any]]  # Upgrades that failed (with reason)

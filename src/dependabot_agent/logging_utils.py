@@ -54,7 +54,7 @@ def log_alerts_summary(alerts: list[dict[str, Any]]) -> None:
         # Group by severity
         severities: dict[str, int] = {}
         for alert in alerts:
-            sev = alert.get("security_advisory", {}).get("severity", "unknown")
+            sev = alert.get("severity")
             severities[sev] = severities.get(sev, 0) + 1
 
         for sev, cnt in sorted(severities.items(), key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(x[0], 4)):

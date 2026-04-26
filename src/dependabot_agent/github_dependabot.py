@@ -41,6 +41,13 @@ def _normalize_alert(raw: dict[str, Any]) -> dict[str, Any]:
     if not package_name and isinstance(dependency.get("package"), dict):
         package_name = dependency["package"].get("name", "")
 
+    # Extract vulnerable version range (e.g., "< 2.17.1", ">= 2.0.0, < 2.17.1")
+    vulnerable_version_range = vulnerability.get("vulnerable_version_range", "")
+
+    # Extract first patched/fixed version (the version to upgrade to)
+    first_patched = vulnerability.get("first_patched_version") or {}
+    first_patched_version = first_patched.get("identifier", "") if isinstance(first_patched, dict) else ""
+
     return {
         "number": raw.get("number"),
         "state": raw.get("state"),
@@ -49,7 +56,8 @@ def _normalize_alert(raw: dict[str, Any]) -> dict[str, Any]:
         "package": package_name,
         "ecosystem": vulnerability.get("package", {}).get("ecosystem"),
         "manifest_path": dependency.get("manifest_path"),
-        "html_url": raw.get("html_url"),
+        "vulnerable_version_range": vulnerable_version_range,
+        "first_patched_version": first_patched_version,
         "created_at": raw.get("created_at"),
         "dismissed_at": raw.get("dismissed_at"),
         "fixed_at": raw.get("fixed_at"),

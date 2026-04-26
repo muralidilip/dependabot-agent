@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import stat
 import subprocess
 from typing import Any
 from urllib.error import HTTPError
@@ -45,14 +44,6 @@ def clone_repo(owner: str, repo: str, branch: str = "develop") -> str:
     if result.returncode != 0:
         # Fallback to main
         _run(["git", "clone", "--depth", "50", "--branch", "main", clone_url, workspace])
-
-    # Ensure build wrapper scripts are executable after clone
-    for wrapper in ("gradlew", "mvnw"):
-        wp = os.path.join(workspace, wrapper)
-        if os.path.isfile(wp):
-            st = os.stat(wp)
-            if not (st.st_mode & stat.S_IXUSR):
-                os.chmod(wp, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     return workspace
 

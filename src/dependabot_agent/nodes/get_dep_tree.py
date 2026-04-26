@@ -18,20 +18,36 @@ def get_dep_tree_node(state: AgentState) -> dict:
     log_node_start("get_dep_tree", "Fetching dependency tree")
 
     try:
-        result = get_dependency_tree.invoke({"workspace": state["workspace"], "context": "get_dep_tree"})
-        tree = result.get("tree", "")
+        # Pass alerts to get focused vulnerability info
+        alerts = state.get("alerts", [])
+        result = get_dependency_tree.invoke({
+            "workspace": state["workspace"],
+            "build_system": state["build_system"],
+            "alerts": alerts,
+            "context": "get_dep_tree"
+        })
 
-        log_node_success(f"Dependency tree fetched ({len(tree)} chars)")
+        raw_tree = result.get("raw_tree", "")
+        vuln_parents = result.get("vulnerability_parents", {})
+
+        # Log vulnerability parent info
+        if vuln_parents:
+            log_node_success(f"Found {len(vuln_parents)} vulnerable dependencies with their parents")
+        else:
+            log_node_success(f"Dependency tree fetched ({len(raw_tree)} chars)")
 
         return {
-            "dependency_tree": tree,
-            "messages": [AIMessage(content=f"Fetched dependency tree ({len(tree)} chars)")],
+            "dependency_tree": raw_tree,
+            "vulnerability_parents": vuln_parents,
+            "messages": [AIMessage(content=f"Fetched dependency tree ({len(raw_tree)} chars, {len(vuln_parents)} vulnerable deps)")],
         }
     except Exception as e:
         # Non-fatal - we can continue without the tree
         log_node_warning(f"Could not get dependency tree: {e}")
         return {
             "dependency_tree": "",
+            "vulnerability_parents": {},
             "messages": [AIMessage(content=f"Warning: Could not get dependency tree: {e}")],
         }
+
 

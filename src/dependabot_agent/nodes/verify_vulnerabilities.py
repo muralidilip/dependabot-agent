@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from typing import Optional
 
 from langchain_core.messages import AIMessage
+from packaging import version as pkg_version
 
 from dependabot_agent.logging_utils import (
     log_node_info,
@@ -14,7 +16,85 @@ from dependabot_agent.logging_utils import (
     log_node_warning,
 )
 from dependabot_agent.state import AgentState
-from dependabot_agent.tools.agent_tools import get_dependency_tree, lookup_maven_version
+from dependabot_agent.tools.agent_tools import get_dependency_tree
+
+
+def normalize_version(ver: str) -> str:
+    """Normalize version string for comparison.
+
+    Handles Maven-style versions like 1.5.25, 4.2.8.Final, 3.1.3.RELEASE
+    """
+    # Remove common suffixes for comparison
+    ver = ver.replace(".RELEASE", "").replace(".Final", "").replace("-RELEASE", "")
+    # Handle Alpha/Beta/RC versions
+    ver = re.sub(r'[.-]?(Alpha|Beta|RC|M)(\d+)?', lambda m: f".dev{m.group(2) or '0'}", ver, flags=re.IGNORECASE)
+    return ver
+
+
+def parse_version(ver_str: str) -> Optional[pkg_version.Version]:
+    """Parse version string into comparable Version object."""
+    try:
+        normalized = normalize_version(ver_str)
+        return pkg_version.parse(normalized)
+    except Exception:
+        return None
+
+
+def is_version_in_vulnerable_range(current_version: str, vulnerable_range: str) -> bool:
+    """Check if a version falls within a vulnerable version range.
+
+    Supports ranges like:
+    - "< 1.5.25"
+    - ">= 4.2.0.Alpha1, < 4.2.8.Final"
+    - "<= 3.1.3.RELEASE"
+    - ">= 3.0, < 3.18.0"
+    """
+    current = parse_version(current_version)
+    if current is None:
+        # Can't parse version, assume still vulnerable
+        return True
+
+    # Split range by comma for compound ranges
+    conditions = [c.strip() for c in vulnerable_range.split(",")]
+
+    for condition in conditions:
+        condition = condition.strip()
+        if not condition:
+            continue
+
+        # Parse operator and version
+        match = re.match(r'([<>=!]+)\s*(.+)', condition)
+        if not match:
+            continue
+
+        operator = match.group(1)
+        range_ver_str = match.group(2).strip()
+        range_ver = parse_version(range_ver_str)
+
+        if range_ver is None:
+            continue
+
+        # Evaluate the condition
+        if operator == "<":
+            if not (current < range_ver):
+                return False
+        elif operator == "<=":
+            if not (current <= range_ver):
+                return False
+        elif operator == ">":
+            if not (current > range_ver):
+                return False
+        elif operator == ">=":
+            if not (current >= range_ver):
+                return False
+        elif operator == "==" or operator == "=":
+            if not (current == range_ver):
+                return False
+        elif operator == "!=":
+            if not (current != range_ver):
+                return False
+
+    return True
 
 
 def verify_vulnerabilities_node(state: AgentState) -> dict:
@@ -33,6 +113,8 @@ def verify_vulnerabilities_node(state: AgentState) -> dict:
     # Get fresh dependency tree with alerts to find remaining vulnerabilities
     log_node_progress("Fetching fresh dependency tree to verify fixes...")
     alerts = state.get("alerts", [])
+
+    alerts_map = {alert['package']: alert for alert in alerts}
     try:
         tree_result = get_dependency_tree.invoke({
             "workspace": state["workspace"],
@@ -42,6 +124,7 @@ def verify_vulnerabilities_node(state: AgentState) -> dict:
         })
         dep_tree = tree_result.get("raw_tree", "")
         vuln_parents = tree_result.get("vulnerability_parents", {})
+        vuln_deps_with_versions = set(vuln_parents.keys()) if vuln_parents else set()
     except Exception as e:
         log_node_warning(f"Could not get dependency tree for verification: {e}")
         # If we can't get the tree, assume vulnerabilities are fixed
@@ -52,136 +135,98 @@ def verify_vulnerabilities_node(state: AgentState) -> dict:
             "messages": [AIMessage(content="Could not verify - assuming clean")],
         }
 
-    # Get vulnerable package names from alerts
-    vulnerable_packages = set()
-    for alert in alerts:
-        pkg = alert.get("package", "")
-        if pkg:
-            vulnerable_packages.add(pkg)
+    # Parse current versions from dependency tree results
+    # vuln_deps_with_versions format: "group:artifact:version"
+    current_versions = {}
+    for dep in vuln_deps_with_versions:
+        parts = dep.split(":")
+        if len(parts) >= 3:
+            pkg_key = f"{parts[0]}:{parts[1]}"
+            current_versions[pkg_key] = parts[2]
 
-    log_node_info(f"Checking {len(vulnerable_packages)} vulnerable packages in dependency tree")
+    log_node_info(f"Found {len(current_versions)} vulnerable packages in dependency tree")
+    log_node_progress(f"Current versions: {current_versions}")
 
-    # Check which vulnerable packages are still in the dependency tree
-    remaining = []
-    resolved = []
+    # Compare current versions against vulnerable ranges
+    still_vulnerable = []
+    fixed_vulnerabilities = []
+    new_vuln_parents = {}
 
-    for pkg in vulnerable_packages:
-        # Normalize package name (may be just artifact or group:artifact)
-        pkg_artifact = pkg.split(":")[-1] if ":" in pkg else pkg
+    for pkg, alert in alerts_map.items():
+        vulnerable_range = alert.get("vulnerable_version_range", "")
+        first_patched = alert.get("first_patched_version", "")
 
-        # Search for the package in the dependency tree
-        # Pattern matches lines like: +--- org.thymeleaf:thymeleaf:3.1.3.RELEASE
-        found = False
-        for line in dep_tree.split("\n"):
-            # Check if this package appears in the line
-            if f":{pkg_artifact}:" in line or line.strip().endswith(f":{pkg_artifact}"):
-                found = True
-                # Extract the full coordinates (group:artifact:version)
-                match = re.search(r'([a-zA-Z0-9._-]+):(' + re.escape(pkg_artifact) + r'):([a-zA-Z0-9._-]+)', line)
-                if match:
-                    found_version = match.group(3)
-                    log_node_progress(f"  Still present: {pkg} at version {found_version}")
-                    remaining.append({
-                        "package": pkg,
-                        "found_version": found_version,
-                        "tree_line": line.strip()
-                    })
-                break
+        if pkg in current_versions:
+            current_ver = current_versions[pkg]
 
-        if not found:
-            log_node_progress(f"  Resolved: {pkg}")
-            resolved.append(pkg)
+            # Check if current version is still in vulnerable range
+            if is_version_in_vulnerable_range(current_ver, vulnerable_range):
+                log_node_warning(f"  ❌ {pkg}@{current_ver} still vulnerable (range: {vulnerable_range})")
 
-    log_node_info(f"Resolved: {len(resolved)}, Still vulnerable: {len(remaining)}")
+                # Get parent info for this vulnerability
+                # vuln_parents keys are "group:artifact:version", we need to match by "group:artifact"
+                parents = []
+                for vuln_coord, parent_list in vuln_parents.items():
+                    if vuln_coord.startswith(f"{pkg}:"):
+                        parents = parent_list
+                        new_vuln_parents[pkg] = parent_list
+                        break
 
-    if not remaining:
+                still_vulnerable.append({
+                    "package": pkg,
+                    "current_version": current_ver,
+                    "vulnerable_range": vulnerable_range,
+                    "first_patched_version": first_patched,
+                    "parents": parents,
+                    "alert": alert
+                })
+            else:
+                log_node_success(f"  ✅ {pkg}@{current_ver} fixed (was vulnerable: {vulnerable_range})")
+                fixed_vulnerabilities.append({
+                    "package": pkg,
+                    "fixed_version": current_ver,
+                    "vulnerable_range": vulnerable_range
+                })
+        else:
+            # Package not found in dependency tree - consider it resolved
+            log_node_progress(f"  ✅ {pkg} not found in dependency tree - resolved")
+            fixed_vulnerabilities.append({
+                "package": pkg,
+                "status": "removed_from_tree",
+                "vulnerable_range": vulnerable_range
+            })
+
+    log_node_info(f"Fixed: {len(fixed_vulnerabilities)}, Still vulnerable: {len(still_vulnerable)}")
+
+    # Update alerts to only keep those that are still vulnerable
+    remaining_alerts = [
+        alerts_map[vuln["package"]]
+        for vuln in still_vulnerable
+        if vuln["package"] in alerts_map
+    ]
+
+    if not still_vulnerable:
         log_node_success("All vulnerable dependencies have been resolved!")
         return {
             "verified_clean": True,
             "verification_attempt_count": attempt,
             "remaining_vulnerabilities": [],
+            "fixed_vulnerabilities": fixed_vulnerabilities,
+            "alerts": [],  # Clear alerts since all are fixed
             "dependency_tree": dep_tree,
             "messages": [AIMessage(content="All vulnerabilities resolved")],
         }
 
-    log_node_warning(f"{len(remaining)} vulnerabilities still present")
+    log_node_warning(f"{len(still_vulnerable)} vulnerabilities still present - need exclusions")
 
-    # Check if we can upgrade further or if we're already at latest
-    # Look at the applied upgrades and see if any can be pushed further
-    good_upgrades = state.get("good_upgrades", []) or state.get("planned_upgrades", [])
-
-    # Track which upgrades have reached their maximum version
-    exhausted = list(state.get("exhausted_upgrades", []))
-    can_upgrade_more = []
-
-    for upgrade in good_upgrades:
-        group_id = upgrade.get("group_id", "")
-        artifact_id = upgrade.get("artifact_id", "")
-        target_version = upgrade.get("target_version", "")
-
-        # Skip if already marked as exhausted
-        upgrade_key = f"{group_id}:{artifact_id}"
-        if any(e.get("group_id") == group_id and e.get("artifact_id") == artifact_id
-               for e in exhausted):
-            continue
-
-        # Check if there's a newer version available
-        try:
-            version_result = lookup_maven_version.invoke({
-                "group_id": group_id,
-                "artifact_id": artifact_id,
-                "current_version": target_version,
-            })
-            latest = version_result.get("latest_version", target_version)
-            upgrade_available = version_result.get("upgrade_available", False)
-
-            if upgrade_available and latest != target_version:
-                log_node_info(f"  {upgrade_key}: can upgrade from {target_version} to {latest}")
-                can_upgrade_more.append({
-                    **upgrade,
-                    "current_version": target_version,  # The version we just applied
-                    "target_version": latest,  # The new target
-                })
-            else:
-                log_node_info(f"  {upgrade_key}: already at latest ({target_version})")
-                exhausted.append({
-                    **upgrade,
-                    "exhausted_at": target_version,
-                })
-        except Exception as e:
-            log_node_warning(f"  Version lookup failed for {upgrade_key}: {e}")
-            # On error, mark as exhausted to avoid infinite loops
-            exhausted.append({
-                **upgrade,
-                "exhausted_at": target_version,
-                "lookup_error": str(e),
-            })
-
-    if can_upgrade_more:
-        log_node_info(f"Can try {len(can_upgrade_more)} more upgrades")
-        # Update planned upgrades to try further upgrades
-        return {
-            "verified_clean": False,
-            "verification_attempt_count": attempt,
-            "remaining_vulnerabilities": remaining,
-            "exhausted_upgrades": exhausted,
-            "dependency_tree": dep_tree,
-            # Reset for another upgrade cycle
-            "planned_upgrades": can_upgrade_more,
-            "good_upgrades": [],  # Clear good upgrades to re-run upgrade flow
-            "pending_upgrade_indices": list(range(len(can_upgrade_more))),
-            "messages": [AIMessage(content=f"Vulnerabilities remain - trying {len(can_upgrade_more)} more upgrades")],
-        }
-    else:
-        # All parent upgrades exhausted, need to try exclusions
-        log_node_warning(f"All parent upgrades exhausted - need exclusions for {len(remaining)} vulnerabilities")
-        return {
-            "verified_clean": False,
-            "verification_attempt_count": attempt,
-            "remaining_vulnerabilities": remaining,
-            "exhausted_upgrades": exhausted,
-            "dependency_tree": dep_tree,
-            "no_upgrades_possible": True,
-            "messages": [AIMessage(content=f"Parent upgrades exhausted - {len(remaining)} vulnerabilities need exclusions")],
-        }
-
+    return {
+        "verified_clean": False,
+        "verification_attempt_count": attempt,
+        "remaining_vulnerabilities": still_vulnerable,
+        "fixed_vulnerabilities": fixed_vulnerabilities,
+        "vulnerability_parents": new_vuln_parents,
+        "alerts": remaining_alerts,  # Keep only unfixed alerts
+        "dependency_tree": dep_tree,
+        "no_upgrades_possible": True,
+        "messages": [AIMessage(content=f"{len(still_vulnerable)} vulnerabilities need exclusions")],
+    }

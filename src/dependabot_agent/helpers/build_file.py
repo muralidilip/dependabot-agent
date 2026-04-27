@@ -553,3 +553,262 @@ def remove_duplicate_exclusions(content: str, build_system: str) -> tuple[str, i
         return remove_duplicate_exclusions_gradle(content)
     else:
         return remove_duplicate_exclusions_maven(content)
+
+
+def find_all_transitive_occurrences(
+    dep_tree: str,
+    group_id: str,
+    artifact_id: str,
+    build_system: str
+) -> list[dict]:
+    """Find all transitive occurrences of a dependency in the tree.
+
+    Searches the dependency tree for ALL places where a given group:artifact
+    appears as a TRANSITIVE dependency (not top-level).
+
+    Args:
+        dep_tree: The raw dependency tree output
+        group_id: The group ID to search for
+        artifact_id: The artifact ID to search for
+        build_system: "gradle" or "maven"
+
+    Returns:
+        List of occurrences, each with:
+        - parent: The immediate parent dependency (group:artifact)
+        - version: The resolved version at this occurrence
+        - declared_version: The originally declared version (before any forcing)
+        - depth: How deep in the tree (1 = direct child of root dep)
+        - path: Full path from root to this occurrence
+    """
+    from dependabot_agent.helpers.dep_tree import parse_dependency_tree
+
+    target_coord = f"{group_id}:{artifact_id}"
+    occurrences = []
+
+    if build_system == "gradle":
+        # Parse the tree to get parent relationships
+        parents_map = parse_dependency_tree(dep_tree)
+
+        # Track current path through tree for each occurrence
+        lines = dep_tree.split("\n")
+
+        # Stack to track path: [(indent_level, "group:artifact:version")]
+        path_stack: list[tuple[int, str]] = []
+
+        for line in lines:
+            if "---" not in line:
+                continue
+
+            # Find indent level
+            dash_pos = line.find("+---")
+            if dash_pos == -1:
+                dash_pos = line.find("\\---")
+            if dash_pos == -1:
+                continue
+
+            # Calculate depth (each level is ~5 chars)
+            depth = dash_pos // 5
+
+            # Extract dependency info
+            dep_part = line[dash_pos:].lstrip("+\\- ")
+            if ":" not in dep_part:
+                continue
+
+            # Clean up - remove (*) and other markers
+            dep_part = dep_part.split("(")[0].strip()
+
+            # Handle version override: group:artifact:declared -> resolved
+            version = ""
+            declared_version = ""
+            match = re.search(
+                r'([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)(?:\s*->\s*([a-zA-Z0-9._-]+))?',
+                dep_part
+            )
+            if match:
+                g = match.group(1)
+                a = match.group(2)
+                declared_version = match.group(3)
+                resolved_version = match.group(4) if match.group(4) else declared_version
+                version = resolved_version
+                coord = f"{g}:{a}"
+            else:
+                # Try simpler pattern without version
+                match = re.search(r'([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)', dep_part)
+                if match:
+                    g = match.group(1)
+                    a = match.group(2)
+                    coord = f"{g}:{a}"
+                else:
+                    continue
+
+            # Update path stack - pop back to current depth
+            while path_stack and path_stack[-1][0] >= depth:
+                path_stack.pop()
+
+            # Check if this is our target AND it's transitive (depth > 0)
+            if coord == target_coord and depth > 0:
+                # Build the path from stack
+                path = [p[1] for p in path_stack] + [f"{coord}:{version}" if version else coord]
+                parent = path_stack[-1][1] if path_stack else None
+
+                if parent:
+                    # Extract just group:artifact from parent (may have version)
+                    parent_match = re.match(r'([^:]+:[^:]+)', parent)
+                    parent_coord = parent_match.group(1) if parent_match else parent
+
+                    occurrences.append({
+                        "parent": parent_coord,
+                        "version": version,
+                        "declared_version": declared_version,
+                        "depth": depth,
+                        "path": path,
+                    })
+
+            # Push current dep onto stack
+            path_stack.append((depth, f"{coord}:{version}" if version else coord))
+
+    else:  # Maven
+        lines = dep_tree.split("\n")
+        path_stack: list[tuple[int, str]] = []
+
+        for line in lines:
+            if ("+-" not in line and "\\-" not in line) or ":" not in line:
+                continue
+
+            # Find marker position
+            marker_pos = line.find("+-")
+            if marker_pos == -1:
+                marker_pos = line.find("\\-")
+            if marker_pos == -1:
+                continue
+
+            # Calculate depth based on prefix
+            prefix = line[:marker_pos]
+            depth = prefix.count("|") + (1 if "|" in prefix or marker_pos > 10 else 0)
+
+            # Extract dependency info
+            match = re.search(
+                r'([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):(?:jar|war|pom):([a-zA-Z0-9._-]+)',
+                line
+            )
+            if not match:
+                continue
+
+            g = match.group(1)
+            a = match.group(2)
+            version = match.group(3)
+            coord = f"{g}:{a}"
+
+            # Update path stack
+            while path_stack and path_stack[-1][0] >= depth:
+                path_stack.pop()
+
+            # Check if this is our target AND it's transitive (has | in prefix)
+            if coord == target_coord and "|" in prefix:
+                path = [p[1] for p in path_stack] + [f"{coord}:{version}"]
+                parent = path_stack[-1][1] if path_stack else None
+
+                if parent:
+                    parent_match = re.match(r'([^:]+:[^:]+)', parent)
+                    parent_coord = parent_match.group(1) if parent_match else parent
+
+                    occurrences.append({
+                        "parent": parent_coord,
+                        "version": version,
+                        "declared_version": version,  # Maven doesn't have overrides like Gradle
+                        "depth": depth,
+                        "path": path,
+                    })
+
+            path_stack.append((depth, f"{coord}:{version}"))
+
+    return occurrences
+
+
+def analyze_pins_for_cleanup(
+    build_content: str,
+    dep_tree: str,
+    build_system: str
+) -> list[dict]:
+    """Analyze all pinned dependencies to determine cleanup eligibility.
+
+    For each pin, finds all transitive occurrences and classifies it as:
+    - "direct_only": Pin has NO transitive occurrences - must be kept
+    - "redundant": Pin matches transitive version - can be removed (was vuln fix)
+    - "version_forcing": Pin forces different version than transitive - must be kept
+
+    Args:
+        build_content: Current build file content
+        dep_tree: Raw dependency tree output
+        build_system: "gradle" or "maven"
+
+    Returns:
+        List of analyzed pins with classification and transitive context
+    """
+    pins = extract_pinned_dependencies_with_version(build_content, build_system)
+    analyzed = []
+
+    for pin in pins:
+        group_id = pin["group_id"]
+        artifact_id = pin["artifact_id"]
+        pinned_version = pin["version"]
+
+        # Find all transitive occurrences
+        occurrences = find_all_transitive_occurrences(
+            dep_tree, group_id, artifact_id, build_system
+        )
+
+        if not occurrences:
+            # No transitive occurrences - this is a direct-only dependency
+            classification = "direct_only"
+            reason = "Pin has no transitive occurrences - it's a direct dependency only"
+        else:
+            # Check both resolved and declared versions
+            # resolved_version: what actually gets used
+            # declared_version: what the transitive would be without forcing
+            resolved_versions = {occ["version"] for occ in occurrences if occ.get("version")}
+            declared_versions = {occ.get("declared_version", occ["version"]) for occ in occurrences if occ.get("version")}
+
+            if not resolved_versions:
+                # No versions found (unusual) - be safe and keep
+                classification = "direct_only"
+                reason = "Could not determine transitive versions"
+            elif declared_versions != resolved_versions:
+                # Version override detected (declared -> resolved)
+                # If pin matches resolved but not declared, the pin is forcing
+                if pinned_version in resolved_versions and pinned_version not in declared_versions:
+                    classification = "version_forcing"
+                    dv_str = ", ".join(sorted(declared_versions))
+                    reason = f"Pin forces {pinned_version}, transitive would be {dv_str}"
+                elif pinned_version not in resolved_versions:
+                    # Pin doesn't match resolved - forcing a different version
+                    classification = "version_forcing"
+                    rv_str = ", ".join(sorted(resolved_versions))
+                    reason = f"Pin forces {pinned_version}, transitive resolves to {rv_str}"
+                else:
+                    # Unusual case - treat as version forcing to be safe
+                    classification = "version_forcing"
+                    reason = f"Version override detected - keeping pin for safety"
+            elif len(resolved_versions) == 1 and pinned_version in resolved_versions:
+                # Pin matches the single transitive version AND no override - redundant
+                classification = "redundant"
+                reason = f"Transitive provides same version {pinned_version} - pin is redundant"
+            elif pinned_version in resolved_versions:
+                # Pin matches one of multiple transitive versions - could be redundant
+                classification = "redundant"
+                reason = f"Transitive provides same version {pinned_version} - pin is redundant"
+            else:
+                # Pin forces a different version
+                classification = "version_forcing"
+                rv_str = ", ".join(sorted(resolved_versions))
+                reason = f"Pin forces {pinned_version}, transitive has {rv_str}"
+
+        analyzed.append({
+            **pin,
+            "transitive_occurrences": occurrences,
+            "classification": classification,
+            "reason": reason,
+        })
+
+    return analyzed
+

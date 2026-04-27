@@ -1,9 +1,12 @@
 """Helpers package for the Dependabot resolver agent."""
 
 from dependabot_agent.helpers.build_file import (
+    analyze_pins_for_cleanup,
     apply_upgrades_to_content,
     extract_dependencies_from_gradle,
     extract_dependencies_from_maven,
+    extract_pinned_dependencies_with_version,
+    find_all_transitive_occurrences,
     find_redundant_pins,
     remove_duplicate_exclusions,
     remove_redundant_pins,
@@ -23,9 +26,12 @@ from dependabot_agent.helpers.llm import extract_build_content, get_llm
 
 __all__ = [
     # Build file helpers
+    "analyze_pins_for_cleanup",
     "apply_upgrades_to_content",
     "extract_dependencies_from_gradle",
     "extract_dependencies_from_maven",
+    "extract_pinned_dependencies_with_version",
+    "find_all_transitive_occurrences",
     "find_redundant_pins",
     "remove_duplicate_exclusions",
     "remove_redundant_pins",
@@ -42,4 +48,3 @@ __all__ = [
     "extract_build_content",
     "get_llm",
 ]
-

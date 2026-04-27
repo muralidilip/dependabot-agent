@@ -164,3 +164,49 @@ If there are no exact duplicates to remove, output "NO_CHANGES".
 Output the COMPLETE cleaned build file content, or "NO_CHANGES".
 """
 
+CLEANUP_DECISION_PROMPT = """\
+You are an expert Java/Gradle/Maven dependency cleanup agent.
+
+Analyze the pinned dependencies and decide which should be RETAINED or REMOVED.
+
+## Rules for Decision:
+
+### MUST RETAIN (do NOT remove):
+1. **direct_only**: Pin has NO transitive occurrences in the dependency tree.
+   This means the user explicitly added this dependency - it's not provided by any other dependency.
+
+2. **version_forcing**: Pin forces a DIFFERENT version than what transitives provide.
+   This means the pin is actively doing something useful (e.g., fixing a vulnerability by forcing a newer version).
+
+### CAN REMOVE (redundant):
+3. **redundant**: Pin has transitive occurrences AND the transitive version MATCHES the pinned version.
+   This means the pin was likely added to fix a vulnerability, but after parent upgrades,
+   the same version is now provided transitively - the pin is no longer needed.
+
+## Pins to Analyze:
+
+{pins_data}
+
+## Your Task:
+
+For each pin, confirm or override the pre-classification. Output a JSON response:
+
+```json
+{{
+  "decisions": [
+    {{
+      "group_id": "...",
+      "artifact_id": "...",
+      "action": "RETAIN" or "REMOVE",
+      "reason": "Brief explanation"
+    }}
+  ]
+}}
+```
+
+IMPORTANT:
+- Be conservative - when in doubt, RETAIN
+- Never remove a direct_only pin
+- Never remove a version_forcing pin
+- Only remove pins classified as redundant where transitive provides the same version
+"""
